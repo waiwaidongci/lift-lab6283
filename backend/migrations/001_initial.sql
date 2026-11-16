@@ -3,3 +3,4 @@
 -- and (dataset_id, subject) uniqueness. In production use reviewed Alembic migrations.
 CREATE INDEX IF NOT EXISTS observations_dataset_idx ON observations (dataset_id);
 CREATE INDEX IF NOT EXISTS analysis_runs_experiment_idx ON analysis_runs (experiment_id);
+CREATE INDEX IF NOT EXISTS analysis_shards_run_idx ON analysis_shards (run_id);

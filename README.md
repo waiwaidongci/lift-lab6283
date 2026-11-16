@@ -39,7 +39,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 2. 09:10 许禾以 analyst 登录，在实验配置登记“短文付费入口 v4”。
 3. 选择已冻结的付费入口数据，写明可检验的业务假设。
 4. 固定收入指标、α=.05，打开 CUPED 校正，提交分析。
-5. 后台 worker 从 Redis 队列取任务，使用 Python 计算 Welch 与 CUPED 结果。
+5. 后台 worker 从 Redis 队列取任务，按固定分片与批边界分批读取观测，计算 Welch 与 CUPED 结果并保存进度。
 6. 09:15 在分析结果检查 1200/1200 样本量、p 值、区间和方差降低，并导出 CSV。
 7. 周澄以 viewer 阅读同一证据；登记接口和归档接口均会拒绝该角色。
 8. 10:00 林序记录“同意放量/继续观察/暂缓上线”及至少 8 字依据，在操作留痕追溯动作。
@@ -49,6 +49,16 @@ docker compose exec -T backend python -m scripts.seed_demo
 - **Welch t 检验**：输入用户级后置收入与分组；差异为候选均值减对照均值。标准误 `sqrt(sA²/nA+sB²/nB)`，Welch–Satterthwaite 自由度，使用 SciPy Student t 双侧尾概率和 `1-alpha` 区间。输出两组均值、样本量、差异、自由度、标准误、p 值和上下界。
 - **CUPED**：输入分桶前协变量 X 与后置收入 Y；合并样本估计 `theta=cov(Y,X)/var(X)`，计算 `Y_adj=Y-theta*(X-mean(X))` 后再做 Welch。输出原始与校正结果，方差降低口径为 `1-SE_adj²/SE_raw²`（可能为负），不把它解释为业务增长。
 - 至少每组 3 人；非有限值、空集、未知分组、组内零方差拒绝；启用 CUPED 时前置指标常量拒绝。固定种子、持久化观测与 SHA256 使结果可复算。算法见 `backend/src/services/statistics_service.py`。
+- **分批与精度**：每个观测先精确缩放为整数（×2¹⁰⁷⁴），按组累加 n、Σx、Σy、Σx²、Σy²、Σxy，最后一次性得到均值、方差、θ 与差异。整数加法可结合可交换，所以批大小和处理顺序不影响结果，合并分片是精确的而非浮点近似。差异在精确分数上相减后才转 float，收入带巨大公共基数时不会因浮点消去而丢失微小差异。
+- 一次分析只保留一个批次和一份充分统计量；实测 100 万行、每批 5000 行时分片分析峰值 RSS 约 117 MB，低于 256 MB 目标（原一次性载入实现约 1.4 GB）。
+
+## 分片、检查点与恢复
+
+- 观测按**观察 id 固定分桶**（`ANALYSIS_SHARD_SIZE`），每个分片在 `analysis_shards` 中有独立检查点：已扫描到的 `last_id`、已计入行数与精确充分统计量。分片边界在创建时写入该行，重启后即使配置的分片大小改变也沿用原边界，不会产生重叠桶。
+- 每批（`ANALYSIS_BATCH_SIZE`）结束时以 `(last_id, completed=false)` 为条件做 compare-and-swap 更新并提交。同一分片被重复或并发处理时只有一个写入者成功，失败者丢弃本地批次并从已提交边界继续，因此每个观测恰好计一次。
+- worker 启动时把遗留的 `running`/`queued` 任务重新入队；`running` 先原子抢占为 `running`（重复队列消息不会并行执行），已完成分片直接复用，写到一半的分片从批边界续算。
+- 只有“所有分片完成、行数合计等于数据集计数、每个分片覆盖到桶内最大 id”三者同时成立才写入结果；任何一项不符会失败，不会把半份汇总混入结果，重试可从检查点继续并得到与一次跑完完全相同的结果。
+- 结果页与 CSV 导出都带样本数（控制/候选/合计）和计算进度；进度来自检查点，进行中的任务每 2 秒刷新。添加分片表后，已有表不会自动升级，需按迁移补建 `analysis_shards` 与 `analysis_shards_run_idx`。
 - 假设用户独立随机分桶、协变量在分桶前取得；只支持单个预注册指标，未做序贯检验、多重比较、离群值稳健估计或聚类相关性校正。95% 区间仅在 α=.05 时成立，结果页按实际 alpha 标注。
 
 ## 功能与工程结构
@@ -84,8 +94,10 @@ frontend/src/{api,stores,types,components,hooks,pages,router,utils,constants}
 | DB_PORT | 17700 | PostgreSQL 宿主映射 |
 | JWT_SECRET | local-demo-lift-lab-change-this-key | 本地演示签名密钥，部署前更换 |
 | SEED_DEMO | true | 后端启动时 seed |
+| ANALYSIS_BATCH_SIZE | 2000 | 每批观测数，也是检查点提交粒度 |
+| ANALYSIS_SHARD_SIZE | 50000 | 按观察 id 划分的分片宽度；每个分片独立检查点 |
 
-命名卷 `db-data`、`redis-data`、`artifacts`；backend/worker 共享产物卷。worker 使用2秒阻塞轮询并持续写心跳；5个容器均有健康检查。后端等待 db/redis healthy，前端等待 backend healthy。单 worker 运行；进程意外退出时已标为 running 的任务需要人工重新提交，本地演示未提供自动重试。停止并清空本项目数据：
+命名卷 `db-data`、`redis-data`、`artifacts`；backend/worker 共享产物卷。worker 使用2秒阻塞轮询并持续写心跳；5个容器均有健康检查。后端等待 db/redis healthy，前端等待 backend healthy。单 worker 运行；进程意外退出后重启会自动接管被中断的任务，并从已提交的批边界续算，无需人工重新提交。停止并清空本项目数据：
 
 ```bash
 docker compose down -v --remove-orphans

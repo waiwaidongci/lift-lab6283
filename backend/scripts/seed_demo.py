@@ -3,7 +3,7 @@ from sqlalchemy import func
 from src.config.database import SessionLocal,Base,engine
 from src.models import User,Dataset,Observation,Experiment,AnalysisRun
 from src.utils.security import hash_password
-from src.services.statistics_service import analyze
+from src.services.analysis_service import execute
 
 def seed():
     Base.metadata.create_all(engine)
@@ -26,8 +26,11 @@ def seed():
                 exp=Experiment(name=name,dataset_id=ds.id,hypothesis=hyp,owner="许禾 · 数据分析师",alpha=.05,cuped=True)
                 db.add(exp);db.flush()
                 if name=="短文付费入口 v3":
-                    result=analyze(db.query(Observation).filter_by(dataset_id=ds.id).all(),.05,True)
-                    db.add(AnalysisRun(experiment_id=exp.id,status="completed",result=result))
+                    # Use the same chunked path as the worker so the demo run
+                    # carries sample size and progress like any other analysis.
+                    run=AnalysisRun(experiment_id=exp.id,status="running")
+                    db.add(run);db.flush()
+                    execute(db,run)
         db.commit()
         print(json.dumps({model.__tablename__:db.query(model).count() for model in [User,Dataset,Observation,Experiment,AnalysisRun]},ensure_ascii=False))
 if __name__=="__main__": seed()
